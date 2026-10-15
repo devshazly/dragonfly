@@ -702,6 +702,16 @@ auto DbSlice::FindInternal(const Context& cntx, string_view key, optional<unsign
   TouchHllIfNeeded(key, db.sample_unique_keys);
   TouchValuesHistogramIfNeeded(it->second, db.sample_values_hist);
 
+  // Readiness checks must not suspend, and expiry may suspend. They report an expired key as
+  // missing, whatever its type, and leave its expiry to the caller, which counts the miss then.
+  // Write lookups expire as usual: reporting a present entry as missing would make AddOrFind
+  // insert a duplicate.
+  if (cntx.deferred_expiry && stats_mode == UpdateStatsMode::kReadStats &&
+      it->first.IsExpired(cntx.time_now_ms) && AllowExpiredDeletions()) {
+    cntx.deferred_expiry->emplace_back(cntx.db_index, key);
+    return OpStatus::KEY_NOTFOUND;
+  }
+
   if (req_obj_type.has_value() && it->second.ObjType() != req_obj_type.value()) {
     events_.misses += miss_weight;
     db.stats.events.misses += miss_weight;
@@ -1528,6 +1538,12 @@ void DbSlice::PostUpdate(DbIndex db_ind, std::string_view key) {
   }
 }
 
+bool DbSlice::AllowExpiredDeletions() const {
+  // Replicas do not expire keys on their own unless replica_delete_expired is set (which allows
+  // them to proactively delete expired keys on the read path).
+  return expire_allowed_ && !(owner_->IsReplica() && !absl::GetFlag(FLAGS_replica_delete_expired));
+}
+
 auto DbSlice::TryExpire(const Context& cntx, PrimeIterator it, vector<string>* events) const
     -> ExpireResult {
   DCHECK(events);
@@ -1537,9 +1553,7 @@ auto DbSlice::TryExpire(const Context& cntx, PrimeIterator it, vector<string>* e
   if (!expire_allowed_)
     return ExpireResult::ExpiryPaused;
 
-  // Replicas do not expire keys on their own unless replica_delete_expired is set (which allows
-  // them to proactively delete expired keys on the read path).
-  if (owner_->IsReplica() && !absl::GetFlag(FLAGS_replica_delete_expired))
+  if (!AllowExpiredDeletions())
     return ExpireResult::Valid;
 
   string scratch;
