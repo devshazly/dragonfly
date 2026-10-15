@@ -72,6 +72,10 @@ class JournalSlice {
   // is a no-op.
   bool SetFlushMode(bool allow_flush);
 
+  bool GetFlushMode() const {
+    return enable_journal_flush_;
+  }
+
   size_t GetRingBufferSize() const {
     return ring_buffer_.size();
   }

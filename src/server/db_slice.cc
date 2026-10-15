@@ -711,9 +711,14 @@ auto DbSlice::FindInternal(const Context& cntx, string_view key, optional<unsign
   if (it->first.HasExpire()) {
     vector<string> events;
     ExpireResult res = TryExpire(cntx, it, &events);
-    // Not in an atomic section, safe to send now.
-    if (!events.empty())
-      SendExpiredKeyEvents(cntx.db_index, events);
+    if (!events.empty()) {
+      // Sending may suspend. A caller that disabled journal flushing (e.g. NotifyPending) is in an
+      // atomic section, so queue the events for it to send afterwards.
+      if (journal::GetFlushMode())
+        SendExpiredKeyEvents(cntx.db_index, events);
+      else
+        const_cast<DbSlice*>(this)->QueueExpiredKeyEvents(cntx.db_index, std::move(events));
+    }
 
     // If expiry is paused, hide expired keys from read lookups. Mutable lookups must still see
     // them: the entry is physically present, and reporting it missing would make AddOrFind insert

@@ -451,9 +451,10 @@ class DbSlice {
   // Sends the expired keyspace event for 'keys'. May suspend: never call it in an atomic section.
   void SendExpiredKeyEvents(DbIndex db_index, const std::vector<std::string>& keys) const;
 
-  // Sends the expired events queued by garbage collection during inserts. OnCbFinishBlocking
-  // calls it; code that inserts outside a transaction callback (e.g. RDB loading) must call it
-  // itself. May suspend.
+  // Sends the expired events queued inside atomic sections (garbage collection during inserts,
+  // lookups with journal flushing disabled). OnCbFinishBlocking calls it; code that inserts or
+  // looks up outside a transaction callback (e.g. RDB loading, NotifyPending) must call it itself.
+  // May suspend.
   void SendQueuedExpiredKeyEvents();
 
   // Iterate over all expire table entries and delete expired.
@@ -755,8 +756,10 @@ class DbSlice {
                           absl::container_internal::hash_default_eq<std::string>, AllocatorType>;
   TrackingMap client_tracking_map_, pending_send_map_;
 
-  // Expired events of keys deleted by garbage collection inside PrimeTable::InsertNew, an atomic
-  // section. Sent in OnCbFinishBlocking. Consecutive events of the same db share one entry.
+  // Expired events of keys deleted inside an atomic section: by garbage collection inside
+  // PrimeTable::InsertNew, or by lookups while journal flushing is disabled (NotifyPending).
+  // Sent in OnCbFinishBlocking and NotifyPending. Consecutive events of the same db share one
+  // entry.
   std::vector<std::pair<DbIndex, std::vector<std::string>>> pending_expired_events_;
 
   void SendQueuedInvalidationMessagesCb(const TrackingMap& track_map, unsigned idx) const;

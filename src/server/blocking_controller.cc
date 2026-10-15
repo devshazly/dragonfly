@@ -11,6 +11,7 @@
 #include "base/logging.h"
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
+#include "server/journal/journal.h"
 #include "server/namespaces.h"
 #include "server/transaction.h"
 
@@ -151,6 +152,31 @@ void BlockingController::NotifyPending() {
   const Transaction* tx = owner_->GetContTx();
   CHECK(tx == nullptr) << tx->DebugId();
 
+  if (awakened_indices_.empty())
+    return;
+
+  // Readiness checks may expire the watched keys, and expiry may suspend: on blocked journal
+  // writes, in the journal throttle, or while sending keyspace events. A suspension would let
+  // other fibers change the watch tables we iterate, so wait for blocked journal writes now,
+  // while nothing is held, and iterate in an atomic section with journal flushing disabled.
+  // Checks then expire inline without suspending; the throttle runs when the guard is destroyed
+  // and the queued events are sent after the iteration.
+  DbSlice& db_slice = ns_->GetDbSlice(owner_->shard_id());
+  db_slice.WaitForUnblockedJournalWrites();
+
+  // A transaction may have started running while we waited; it notifies when it concludes.
+  if (owner_->GetContTx() != nullptr)
+    return;
+
+  {
+    journal::DisableFlushGuard flush_guard;
+    NotifyPendingAtomic();
+  }
+
+  db_slice.SendQueuedExpiredKeyEvents();
+}
+
+void BlockingController::NotifyPendingAtomic() {
   DbContext context;
   context.ns = ns_;
   context.time_now_ms = GetCurrentTimeMs();
