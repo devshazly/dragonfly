@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <type_traits>
+#include <utility>
 #include <variant>
 
 #include "base/logging.h"
@@ -676,133 +677,124 @@ struct BasicSearch {
     return IndexResult{std::move(out)};
   }
 
-  // Determine node type and call specific search function
-  // Iterative post-order evaluation: an explicit work stack keeps a deep query tree off the fiber
-  // stack. `top_level` suppresses the sorted-result DCHECK for the root.
+  // Visit one child at a time; only the current path needs traversal frames.
   IndexResult SearchGeneric(const AstNode& root, string_view root_field, bool top_level = false) {
     struct Frame {
-      Frame(const AstNode* node, string_view active_field, double weight, bool top_level)
-          : node(node), active_field(active_field), weight(weight), top_level(top_level) {
-      }
-
       const AstNode* node;
-      string_view active_field;
+      string_view field;
       double weight;
-      bool top_level;
-      bool entered = false;
-      size_t results_base = 0;  // index into `values` where this node's children begin
-      string saved_error;       // AstOptionalNode only
+      size_t results_base;
+      size_t next_child;
       ProfileBuilder::Tp start;
+      AstNode::Type type;
     };
-
-    vector<IndexResult> values;  // completed results, consumed by parents on their leave pass
+    vector<IndexResult> values;
     vector<Frame> stack;
-
-    // Asserts the sorted-result invariant, records the profile event, and hands the result up.
-    auto finalize = [&](const Frame& f, const AstNode& n, IndexResult result) {
+    const double root_weight = current_weight_;
+    const AstNode* current = &root;
+    auto record = [&](const AstNode& node, ProfileBuilder::Tp start, const IndexResult& result) {
       DCHECK(
-          f.top_level || n.Is<AstKnnNode>() || n.Is<AstGeoNode>() || n.Is<AstVectorRangeNode>() ||
+          (top_level && &node == &root) || node.Is<AstKnnNode>() || node.Is<AstGeoNode>() ||
+          node.Is<AstVectorRangeNode>() ||
           visit([](auto* set) { return is_sorted(set->begin(), set->end()); }, result.Borrowed()));
       if (profile_builder_)
-        profile_builder_->Finish(f.start, n, result);
-      values.push_back(std::move(result));
+        profile_builder_->Finish(start, node, result);
     };
-
-    stack.push_back(Frame{&root, root_field, current_weight_, top_level});
-
-    while (!stack.empty()) {
-      Frame& f = stack.back();
-      const AstNode& n = *f.node;
-
-      if (!f.entered) {
-        f.entered = true;
-
-        // A pending error short-circuits to an empty result, unprofiled.
+    while (current || !stack.empty()) {
+      if (current) {
+        const auto* node = std::exchange(current, nullptr);
         if (!error_.empty()) {
-          values.push_back(IndexResult{});
-          stack.pop_back();
+          if (stack.empty())
+            return IndexResult{};
+          values.emplace_back();
           continue;
         }
-
-        f.start = profile_builder_ ? profile_builder_->Start() : ProfileBuilder::Tp{};
-        f.results_base = values.size();
-        current_weight_ = f.weight;
-
-        // Copy before pushing: a stack reallocation would dangle f.
-        const string_view af = f.active_field;
-        const double w = f.weight;
-
-        // Expand composite nodes; push in reverse to keep left-to-right evaluation order.
-        if (auto* fld = n.As<AstFieldNode>()) {
-          DCHECK(af.empty());
-          DCHECK(fld->node);
-          stack.push_back(Frame{fld->node.get(), fld->field, w, false});
-        } else if (auto* attr = n.As<AstAttributeNode>()) {
-          stack.push_back(Frame{attr->node.get(), af, w * attr->weight, false});
-        } else if (auto* neg = n.As<AstNegateNode>()) {
-          stack.push_back(Frame{neg->node.get(), af, w, false});
-        } else if (auto* opt = n.As<AstOptionalNode>()) {
-          // ~ never fails outward: save/clear error_ here, restore on leave.
-          const AstNode* child = opt->node.get();
-          f.saved_error = std::move(error_);
-          error_.clear();
-          stack.push_back(Frame{child, af, w, false});
-        } else if (auto* logical = n.As<AstLogicalNode>()) {
-          for (auto it = logical->nodes.rbegin(); it != logical->nodes.rend(); ++it) {
-            // Drop stopword operands: they match nothing.
-            if (const auto* term = (*it)->As<AstTermNode>();
-                term && indices_->IsStopWord(term->affix))
-              continue;
-            stack.push_back(Frame{it->get(), af, w, false});
-          }
-        } else if (auto* knn = n.As<AstKnnNode>()) {
-          if (knn->filter)
-            stack.push_back(Frame{knn->filter.get(), af, w, false});
-        } else {
-          // Leaf: evaluate now. Composite nodes are handled above.
-          IndexResult result;
-          VisitAst(n, [&](const auto& leaf) {
-            if constexpr (
-                requires { leaf.node; } || requires { leaf.nodes; } || requires { leaf.filter; }) {
-              DCHECK(false);
-            } else {
-              result = Search(leaf, af);
+        const auto field = stack.empty() ? root_field : stack.back().field;
+        current_weight_ = stack.empty() ? root_weight : stack.back().weight;
+        const auto start = profile_builder_ ? profile_builder_->Start() : ProfileBuilder::Tp{};
+        optional<IndexResult> root_result;
+        VisitAst(*node, [&](const auto& typed) {
+          using Node = decay_t<decltype(typed)>;
+          if constexpr (
+              requires { typed.node; } || requires { typed.nodes; } || requires { typed.filter; }) {
+            stack.push_back({node, field, current_weight_, values.size(), 0, start, Node::kType});
+            auto& frame = stack.back();
+            if constexpr (is_same_v<Node, AstFieldNode>) {
+              DCHECK(field.empty());
+              frame.field = typed.field;
+            } else if constexpr (is_same_v<Node, AstAttributeNode>) {
+              frame.weight *= typed.weight;
             }
-          });
-          finalize(f, n, std::move(result));
-          stack.pop_back();
-        }
+            if constexpr (requires { typed.node; }) {
+              current = typed.node.get();
+            } else if constexpr (requires { typed.filter; }) {
+              current = typed.filter.get();
+            }
+          } else {
+            auto result = Search(typed, field);
+            record(*node, start, result);
+            if (stack.empty())
+              root_result.emplace(std::move(result));
+            else
+              values.push_back(std::move(result));
+          }
+        });
+        if (root_result)
+          return std::move(*root_result);
         continue;
       }
-
-      // Leave pass: this node's children results occupy values[f.results_base, end).
-      current_weight_ = f.weight;
-      const size_t results_base = f.results_base;
-      IndexResult result;
-      if (n.Is<AstNegateNode>()) {
-        result = EvalNegate(std::move(values[results_base]));
-      } else if (n.As<AstFieldNode>() || n.As<AstAttributeNode>()) {
-        result = std::move(values[results_base]);  // pass the single child's result through
-      } else if (n.As<AstOptionalNode>()) {
-        error_ = std::move(f.saved_error);
-        result = IndexResult{&indices_->GetAllDocs()};  // ~ never filters: all docs
-      } else if (auto* logical = n.As<AstLogicalNode>()) {
-        result = UnifyResults(absl::MakeSpan(values).subspan(results_base), logical->op);
-      } else if (auto* knn = n.As<AstKnnNode>()) {
-        IndexResult sub =
-            values.size() > results_base ? std::move(values[results_base]) : IndexResult{};
-        result = EvalKnn(*knn, f.active_field, std::move(sub));
-      } else {
-        DCHECK(false);  // leaves are finalized on the enter pass and never reach here
+      auto& frame = stack.back();
+      const auto& node = *frame.node;
+      if (frame.type == AstNode::Type::LOGICAL) {
+        const auto& logical = static_cast<const AstLogicalNode&>(node);
+        while (frame.next_child < logical.nodes.size()) {
+          const auto* child = logical.nodes[frame.next_child++].get();
+          if (const auto* term = child->As<AstTermNode>();
+              term && indices_->IsStopWord(term->affix))
+            continue;
+          current = child;
+          break;
+        }
+        if (current)
+          continue;
       }
-
-      values.resize(results_base);
-      finalize(f, n, std::move(result));
+      current_weight_ = stack.size() > 1 ? stack[stack.size() - 2].weight : root_weight;
+      const auto base = frame.results_base;
+      IndexResult result;
+      switch (frame.type) {
+        case AstNode::Type::NEGATE:
+          result = EvalNegate(std::move(values[base]));
+          break;
+        case AstNode::Type::FIELD:
+        case AstNode::Type::ATTRIBUTE:
+          result = std::move(values[base]);
+          break;
+        case AstNode::Type::OPTIONAL:
+          // Entry is skipped while an error is pending, so the outer error was empty.
+          error_ = string{};
+          result = IndexResult{&indices_->GetAllDocs()};
+          break;
+        case AstNode::Type::LOGICAL:
+          result = UnifyResults(absl::MakeSpan(values).subspan(base),
+                                static_cast<const AstLogicalNode&>(node).op);
+          break;
+        case AstNode::Type::KNN: {
+          auto sub = values.size() > base ? std::move(values[base]) : IndexResult{};
+          result = EvalKnn(static_cast<const AstKnnNode&>(node), frame.field, std::move(sub));
+          break;
+        }
+        default:
+          DCHECK(false);
+      }
+      values.resize(base);
+      record(node, frame.start, result);
       stack.pop_back();
+      if (stack.empty())
+        return result;
+      values.push_back(std::move(result));
     }
-
-    DCHECK_EQ(values.size(), 1u);
-    return std::move(values.back());
+    DCHECK(false);
+    return IndexResult{};
   }
 
   SearchResult Search(const AstNode& query, size_t cuttoff_limit) {
